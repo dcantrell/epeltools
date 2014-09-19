@@ -1,0 +1,180 @@
+#!/bin/bash
+#
+# inepel
+# Given a list of binary RPM files, report if these are safe to add to EPEL.
+#
+# Copyright (C) 2014
+# Red Hat, Inc.  All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Author(s): David Cantrell <dcantrell@redhat.com>
+#
+
+#
+# Limitations/laziness:
+# 1) Repo URLs are inconsistent, so just provide command line options to
+#    specify all of the ones you want to use.  If there is a central listing
+#    or some programatic way to get repo URIs, feel free to change it.
+# 2) This just invokes yum directly, so it'll only work for the host arch or
+#    noarch packages.
+# 3) GPG check disabled because this is just a collision avoidance test.
+# 4) Logging could be improved for integration in to automated systems.
+#
+
+VER=0.1
+
+PATH=/usr/bin
+
+CWD="$(pwd)"
+PROG="$(basename $0)"
+TMPDIR=$(mktemp -d)
+REPOSDIR=$TMPDIR/yum.repos.d
+TESTREPO=$TMPDIR/epeltest
+YUMCONF="$TMPDIR/yum.conf"
+
+usage() {
+    echo "$PROG [options] [RPM package]..."
+    echo "Options:"
+    echo "    -o URI, --os=URI       Operating system repo to test against"
+    echo "    -u URI, --updates=URI  OS updates repo to test against (optional)"
+    echo "    -e URI, --epel=URI     EPEL repo to test against"
+    echo "    -V, --version          Display version"
+    echo "    -h, --help             Display help"
+}
+
+write_repo_conf() {
+    name="$1"
+    uri="$2"
+    repo=$REPOSDIR/$name.repo
+
+    echo "[$name]" > $repo
+    echo "name=$name" >> $repo
+    echo "baseurl=$uri" >> $repo
+    echo "enabled=1" >> $repo
+    echo "gpgcheck=0" >> $repo
+    echo "repo_gpgcheck=0" >> $repo
+    echo "keepcache=0" >> $repo
+}
+
+if [ $# -eq 0 ]; then
+    echo "Missing required options, see --help for more information." >&2
+    exit 1
+fi
+
+mkdir -p "$REPOSDIR"
+
+# Gather options
+OPTS=$(getopt -o o:u:e:Vh --long os:,updates:,epel:,help,version -n $PROG -- "$@")
+if [ $? -ne 0 ]; then
+    echo "Terminating..." >&2
+    exit 1
+fi
+
+eval set -- "$OPTS"
+
+while true ; do
+    case "$1" in
+        -o|--os)
+            write_repo_conf os "$2"
+            shift 2 ;;
+        -u|--updates)
+            write_repo_conf updates "$2"
+            shift 2 ;;
+        -e|--epel)
+            write_repo_conf epel "$2"
+            shift 2 ;;
+        -h|--help)
+            usage
+            exit 0 ;;
+        -V|--version)
+            echo "$PROG version $VER"
+            exit 0 ;;
+        --)
+            shift
+            break ;;
+        *)
+            echo "Internal error!" >&2
+            exit 1 ;;
+    esac
+done
+
+if [ -z "$*" ]; then
+    echo "No packages specified, see --help for more information." >&2
+    rm -rf "$TMPDIR"
+    exit 1
+fi
+
+# We should only be given RPM package arguments
+for pkg in $* ; do
+    if [ ! -f "$pkg" ]; then
+        rm -rf $TMPDIR
+        echo "$pkg is not a file." >&2
+        exit 1
+    fi
+done
+
+# Copy the packages to test in to a temp tree
+mkdir -p "$TESTREPO"
+for pkg in $* ; do
+    cp -p "$pkg" "$TESTREPO"
+done
+
+# Create the test repo
+( cd "$TESTREPO" && createrepo -q . )
+TESTURI="file://$TESTREPO"
+TESTURI_LEN=$(echo "$TESTURI" | wc -c)
+write_repo_conf test "$TESTURI"
+
+# Temporary yum.conf
+echo "[main]" > $YUMCONF
+echo "cachedir=$TMPDIR/var/cache/yum" >> $YUMCONF
+echo "persistdir=$TMPDIR/var/lib/yum" >> $YUMCONF
+echo "keepcache=0" >> $YUMCONF
+echo "reposdir=$REPOSDIR" >> $YUMCONF
+echo "gpgcheck=0" >> $YUMCONF
+mkdir -p "$TMPDIR/var/cache/yum"
+mkdir -p "$TMPDIR/var/lib/yum"
+
+# Let's check for duplicates for each package
+ret=0
+for pkg in $* ; do
+    pkgname="$(rpm -qp --queryformat "%{name}\n" "$pkg")"
+    result="$(repoquery -c $YUMCONF --show-duplicates --location "$pkgname")"
+    num=$(echo "$result" | wc -l)
+
+    if [ $num -eq 1 ]; then
+        # one repo provides this package, see if it's our test repo
+        uri="$(echo "$result" | cut -c-${TESTURI_LEN})"
+        if [ "$uri" = "${TESTURI}/" ]; then
+            echo "GOOD: '$pkgname'"
+            ret=0
+        else
+            echo "FAIL: '$pkgname' is provided by an existing repo."
+            ret=2
+        fi
+    elif [ $num -le 0 ]; then
+        echo "No repo is providing '$pkgname'."
+    elif [ $num -ge 2 ]; then
+        echo "FAIL: '$pkgname' is provided by multiple repos:"
+        echo "$result"
+        ret=2
+    else
+        echo "Unknown error occurred, num=$num.\n" >&2
+        ret=1
+    fi
+done
+
+rm -rf "$TMPDIR"
+exit $ret
